@@ -1,0 +1,7 @@
+{
+  "event_id": "g1-t1-0002",
+  "device_id": "g1-d01",
+  "observed_at": "2026-09-29T10:00:00",
+  "type": "anomaly",
+  "note": "observed_at 少了時區，預期 400 且 field=observed_at"
+}

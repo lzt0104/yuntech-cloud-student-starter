@@ -1,0 +1,7 @@
+{
+  "event_id": "g1-t1-0001",
+  "device_id": "g1-d01",
+  "observed_at": "2026-09-29T10:00:00+08:00",
+  "type": "status",
+  "note": "巡檢正常"
+}
