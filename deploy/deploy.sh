@@ -180,7 +180,7 @@ fi
 
 # ---- 3) 秘密檔經 stdin 落地（root、600），再重啟一次 inspection ----
 echo "== 放置權杖秘密檔並重啟服務 =="
-"${SSH[@]}" "sudo install -d -m 700 /etc/inspection && \
+"${SSH[@]}" "sudo install -d -m 755 /etc/inspection && \
              sudo sh -c 'umask 077; cat > /etc/inspection/app.env' && \
              sudo chown root:root /etc/inspection/app.env && \
              sudo chmod 600 /etc/inspection/app.env && \

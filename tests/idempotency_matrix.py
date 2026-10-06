@@ -5,12 +5,12 @@ import pathlib
 import stat
 import subprocess
 import sys
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TIMEOUT = 10
-EVENT_ID = "g1-w5-0001"
 DEVICE_ID = "g1-d01"
 OBSERVED_AT = "2026-10-06T10:00:00+08:00"
 
@@ -83,11 +83,17 @@ def remote_restart(ssh):
         raise RuntimeError("remote restart failed")
 
 
-def remote_count(ssh):
-    command = """sudo bash -c 'set -a; . /etc/inspection/app.env; set +a
-PGPASSWORD="$DB_PASSWORD" psql "host=$DB_HOST dbname=$DB_NAME user=$DB_USER sslmode=verify-full sslrootcert=/etc/inspection/rds-ca.pem" -v event_id=g1-w5-0001 -Atc "SELECT count(*) FROM events WHERE event_id = :'event_id';"'"""
-    result = subprocess.run(ssh + [command], cwd=ROOT, capture_output=True, text=True,
-                            timeout=30, check=False)
+def remote_count(ssh, event_id):
+    script = """set -a
+. /etc/inspection/app.env
+set +a
+PGPASSWORD="$DB_PASSWORD" psql "host=$DB_HOST dbname=$DB_NAME user=$DB_USER sslmode=verify-full sslrootcert=/etc/inspection/rds-ca.pem" \\
+    -v event_id="%s" -At <<'SQL'
+SELECT count(*) FROM events WHERE event_id = :'event_id';
+SQL
+""" % event_id
+    result = subprocess.run(ssh + ["sudo bash -s"], input=script, cwd=ROOT,
+                            capture_output=True, text=True, timeout=30, check=False)
     if result.returncode:
         return "（psql 未完成）"
     return result.stdout.strip() or "（空本文）"
@@ -95,6 +101,7 @@ PGPASSWORD="$DB_PASSWORD" psql "host=$DB_HOST dbname=$DB_NAME user=$DB_USER sslm
 
 def main():
     reporter, operator = load_tokens()
+    event_id = "g1-w5-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     if len(sys.argv) > 1:
         base = sys.argv[1].rstrip("/")
         if not base.startswith(("http://", "https://")):
@@ -116,7 +123,7 @@ def main():
         print("db_configured: （讀不到 /health）")
     print(f"/health HTTP: {health_code}")
 
-    first = {"event_id": EVENT_ID, "device_id": DEVICE_ID, "observed_at": OBSERVED_AT,
+    first = {"event_id": event_id, "device_id": DEVICE_ID, "observed_at": OBSERVED_AT,
              "type": "status", "note": "巡檢正常"}
     conflict = dict(first, note="內容不同")
     rows = [
@@ -137,11 +144,11 @@ def main():
         return 1
     try:
         remote_restart(ssh)
-        code, text = request(base, "GET", "/events/" + EVENT_ID, operator)
+        code, text = request(base, "GET", "/events/" + event_id, operator)
         print(f"#4 HTTP {code}（預期 200）: {compact(text)}")
     except Exception as exc:
         print(f"#4 HTTP 無回應（預期 200）: （{type(exc).__name__}）")
-    print(f"#5 psql 筆數（預期 1）: {remote_count(ssh)}")
+    print(f"#5 psql 筆數（預期 1）: {remote_count(ssh, event_id)}")
     return 0
 
 
