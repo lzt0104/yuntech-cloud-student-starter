@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# W4 個人部署：把「已 commit 的版本」裝到原本那台主機，並放置權杖秘密檔。
+# W5 個人部署：把「已 commit 的版本」裝到原本那台主機，並放置服務秘密檔。
 # 用法: bash deploy/deploy.sh [commit]      commit 預設 HEAD
 # 所有 AWS 呼叫皆透過 scripts/lab.py 的 run_aws（learnerlab profile）
 # 規格（labs/04-web-api/README.md「權杖與 deploy.sh」四條）：
@@ -12,7 +12,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 SETTINGS=".local/w03.env"
 SECRET=".local/app.env"
-BUNDLE=".local/w04-user-data.sh"
+DB_SECRET=".local/db.env"
+BUNDLE=".local/w05-user-data.sh"
 
 # ---- 設定與身分 ----
 [[ -f "$SETTINGS" ]] || { echo "STOP: 缺少 $SETTINGS（先跑過 W3 的 deploy/up.sh 才有）" >&2; exit 1; }
@@ -71,6 +72,11 @@ SECRET_MODE="$(stat -c '%a' "$SECRET")"
 [[ "$SECRET_MODE" == "600" ]] || { echo "STOP: $SECRET 權限是 $SECRET_MODE，必須是 600；請 chmod 600 後再執行" >&2; exit 1; }
 echo "秘密檔 $SECRET 權限 600 OK（內容未讀出）"
 
+[[ -f "$DB_SECRET" ]] || { echo "STOP: 缺少 $DB_SECRET（先執行 deploy/db-up.sh）" >&2; exit 1; }
+DB_SECRET_MODE="$(stat -c '%a' "$DB_SECRET")"
+[[ "$DB_SECRET_MODE" == "600" ]] || { echo "STOP: $DB_SECRET 權限是 $DB_SECRET_MODE，必須是 600；請 chmod 600 後再執行" >&2; exit 1; }
+echo "秘密檔 $DB_SECRET 權限 600 OK（內容未讀出）"
+
 [[ -f "$KEY_FILE" ]] || { echo "STOP: 缺少私鑰 $KEY_FILE（沿用 W3 產生的那把）" >&2; exit 1; }
 chmod 600 "$KEY_FILE"
 for key in REPORTER_TOKEN OPERATOR_TOKEN; do
@@ -79,6 +85,12 @@ for key in REPORTER_TOKEN OPERATOR_TOKEN; do
   fi
 done
 echo "秘密檔含 REPORTER_TOKEN / OPERATOR_TOKEN 兩個鍵 OK"
+for key in DB_HOST DB_NAME DB_USER DB_PASSWORD; do
+  if ! grep -q "^${key}=" "$DB_SECRET"; then
+    echo "STOP: $DB_SECRET 缺少 $key（只檢查鍵名，不顯示值）" >&2; exit 1
+  fi
+done
+echo "秘密檔含 DB_HOST / DB_NAME / DB_USER / DB_PASSWORD 四個鍵 OK"
 
 if [[ -n "$(git status --porcelain -- app/service.py deploy/nginx.conf)" ]]; then
   echo "注意: app/service.py 或 deploy/nginx.conf 有未 commit 修改；打包只取 $SHA"
@@ -121,8 +133,8 @@ cat <<EOF
 將要在「同一台主機」上執行（不建立任何新 AWS 資源）：
   1. 打包已 commit 的 $SHA（deploy/make-user-data.sh，與 up.sh 同一份）
   2. SSH 進 $IID（$IP）跑安裝腳本：更新 /opt/inspection 與 systemd unit，重啟 inspection、reload nginx
-  3. 經 SSH 標準輸入寫入 /etc/inspection/app.env（root、600），再重啟一次 inspection
-  4. 讀回 /health：要求 version=$SHA 且 auth_configured=true
+  3. 經 SSH 標準輸入合併寫入 /etc/inspection/app.env（root、600），再重啟一次 inspection
+  4. 讀回 /health：要求 version=$SHA、auth_configured=true、db_configured=true
 不會印出權杖、不會把權杖放進命令列、不進 user data、不進 Git。
 注意：重啟 inspection 會清空記憶體裡的事件（README：本週事件只存記憶體）。
 EOF
@@ -172,12 +184,12 @@ echo "== 放置權杖秘密檔並重啟服務 =="
              sudo sh -c 'umask 077; cat > /etc/inspection/app.env' && \
              sudo chown root:root /etc/inspection/app.env && \
              sudo chmod 600 /etc/inspection/app.env && \
-             sudo systemctl restart inspection" < "$SECRET"
+             sudo systemctl restart inspection" < <(cat "$SECRET" "$DB_SECRET")
 
 # 讀回主機上的權限與鍵名（只讀 metadata，不讀內容）
-"${SSH[@]}" "stat -c 'app.env 權限=%a 擁有者=%U' /etc/inspection/app.env; \
-             grep -c '^REPORTER_TOKEN=' /etc/inspection/app.env; \
-             grep -c '^OPERATOR_TOKEN=' /etc/inspection/app.env"
+"${SSH[@]}" "sudo stat -c 'app.env 權限=%a 擁有者=%U' /etc/inspection/app.env; \
+             sudo grep -c '^REPORTER_TOKEN=' /etc/inspection/app.env; \
+             sudo grep -c '^OPERATOR_TOKEN=' /etc/inspection/app.env"
 
 # 等服務真的起來再驗收（restart 後 8080 可能還沒 listen）
 for _ in $(seq 1 20); do
@@ -189,7 +201,7 @@ done
 "${SSH[@]}" "systemctl is-active inspection; ss -tln | grep -c ':8080 '" || true
 
 # ---- 4) 資料通道驗收：version 與 auth_configured ----
-VER=""; AUTH=""; CODE=""
+VER=""; AUTH=""; DB_CONFIGURED=""; CODE=""
 for _ in $(seq 1 30); do
   CODE="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "http://${IP}/health" || true)"
   BODY="$(curl -sS -m 5 "http://${IP}/health" || true)"
@@ -199,17 +211,20 @@ except Exception: print("")' 2>/dev/null || true)"
   AUTH="$(printf '%s' "$BODY" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("auth_configured"))
 except Exception: print("")' 2>/dev/null || true)"
-  if [[ "$CODE" == "200" && "$VER" == "$SHA" && "$AUTH" == "True" ]]; then break; fi
+  DB_CONFIGURED="$(printf '%s' "$BODY" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("db_configured"))
+except Exception: print("")' 2>/dev/null || true)"
+  if [[ "$CODE" == "200" && "$VER" == "$SHA" && "$AUTH" == "True" && "$DB_CONFIGURED" == "True" ]]; then break; fi
   sleep 3
 done
 echo "== /health =="
 curl -sS -m 5 "http://${IP}/health" || true
 echo
-[[ "$CODE" == "200" && "$VER" == "$SHA" && "$AUTH" == "True" ]] \
-  || { echo "STOP: 驗收未通過 (http=$CODE version=$VER auth_configured=$AUTH)" >&2; exit 1; }
+[[ "$CODE" == "200" && "$VER" == "$SHA" && "$AUTH" == "True" && "$DB_CONFIGURED" == "True" ]] \
+  || { echo "STOP: 驗收未通過 (http=$CODE version=$VER auth_configured=$AUTH db_configured=$DB_CONFIGURED)" >&2; exit 1; }
 
 record public_ip "$IP"
 echo
-echo "SUCCESS: 已更新同一台主機，version=$SHA，auth_configured=true"
+echo "SUCCESS: 已更新同一台主機，version=$SHA，auth_configured=true，db_configured=true"
 echo "顯示頁: http://${IP}/ （貼 operator 權令牌；權令牌由你本人貼，勿交給 Agent）"
-echo "下一步: 跑拒絕矩陣 7 列。事件只存在記憶體，同一個服務行程內重複 event_id 才會 409。"
+echo "下一步: 跑 tests/idempotency_matrix.py 的 W5 冪等矩陣 5 列。"

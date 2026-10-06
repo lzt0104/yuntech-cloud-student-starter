@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""W4 inspection service: authenticated event ingest, query and display page.
+"""W5 inspection service: authenticated event ingest, query and display page.
 
-Events live in process memory only (by design; W5 adds a database).
+Events use PostgreSQL when database secrets are configured, with an offline
+in-memory fallback before deployment.
 Secrets come from the systemd EnvironmentFile /etc/inspection/app.env and are
 never logged, echoed in error responses or written to the display page.
 """
@@ -14,6 +15,11 @@ from pathlib import Path
 import re
 import threading
 from urllib.parse import unquote, urlsplit
+
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 
 MAX_BODY = 4096
 MAX_LIST = 50
@@ -28,18 +34,19 @@ TIMESTAMP_RE = re.compile(
 
 
 class Store:
-    """Insertion-ordered in-memory event store; one writer lock, no disk."""
+    """Offline fallback store used before database secrets are installed."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._items = {}
 
-    def add(self, event):
+    def put(self, event):
         with self._lock:
-            if event["event_id"] in self._items:
-                return False
+            existing = self._items.get(event["event_id"])
+            if existing is not None:
+                return ("same" if same_event(existing, event) else "conflict"), existing
             self._items[event["event_id"]] = event
-            return True
+            return "created", event
 
     def get(self, event_id):
         with self._lock:
@@ -49,6 +56,94 @@ class Store:
         with self._lock:
             items = list(self._items.values())
         return list(reversed(items[-limit:]))
+
+
+def database_config():
+    values = {name: os.environ.get(name, "").strip() for name in
+              ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")}
+    return values if all(values.values()) and psycopg2 is not None else None
+
+
+def same_event(left, right):
+    return all(left.get(name) == right.get(name)
+               for name in ("event_id", "device_id", "observed_at", "type", "note"))
+
+
+class PostgresStore:
+    """PostgreSQL-backed event store; uniqueness is decided by the primary key."""
+
+    COLUMNS = "event_id, device_id, observed_at, type, note, received_at"
+
+    def __init__(self, config):
+        self.config = config
+        self._schema_ready = False
+        self._lock = threading.Lock()
+
+    def _connect(self):
+        return psycopg2.connect(host=self.config["DB_HOST"], dbname=self.config["DB_NAME"],
+                                user=self.config["DB_USER"], password=self.config["DB_PASSWORD"],
+                                sslmode="verify-full", sslrootcert="/etc/inspection/rds-ca.pem")
+
+    def _ensure_schema(self, connection):
+        if self._schema_ready:
+            return
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    event_id VARCHAR(64) PRIMARY KEY,
+                    device_id VARCHAR(32) NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    type VARCHAR(16) NOT NULL,
+                    note TEXT,
+                    received_at TIMESTAMPTZ NOT NULL
+                )
+            """)
+        connection.commit()
+        self._schema_ready = True
+
+    @staticmethod
+    def _event(row):
+        event = dict(zip(("event_id", "device_id", "observed_at", "type", "note", "received_at"), row))
+        received_at = event["received_at"].astimezone(timezone.utc)
+        event["received_at"] = received_at.isoformat(timespec="seconds").replace("+00:00", "Z")
+        return event
+
+    def put(self, event):
+        with self._lock:
+            with self._connect() as connection:
+                self._ensure_schema(connection)
+                with connection.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO events (event_id, device_id, observed_at, type, note, received_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (event_id) DO NOTHING
+                        RETURNING event_id, device_id, observed_at, type, note, received_at
+                    """, (event["event_id"], event["device_id"], event["observed_at"],
+                          event["type"], event.get("note"), event["received_at"]))
+                    row = cursor.fetchone()
+                    if row is not None:
+                        return "created", self._event(row)
+                    cursor.execute("SELECT " + self.COLUMNS + " FROM events WHERE event_id = %s",
+                                   (event["event_id"],))
+                    existing = self._event(cursor.fetchone())
+                    return ("same" if same_event(existing, event) else "conflict"), existing
+
+    def get(self, event_id):
+        with self._connect() as connection:
+            self._ensure_schema(connection)
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT " + self.COLUMNS + " FROM events WHERE event_id = %s",
+                               (event_id,))
+                row = cursor.fetchone()
+                return self._event(row) if row is not None else None
+
+    def latest(self, limit):
+        with self._connect() as connection:
+            self._ensure_schema(connection)
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT " + self.COLUMNS +
+                               " FROM events ORDER BY received_at DESC LIMIT %s", (limit,))
+                return [self._event(row) for row in cursor.fetchall()]
 
 
 def tokens_from_env():
@@ -173,7 +268,7 @@ input,button{font-size:1rem;padding:.4rem}
 """
 
 
-def make_server(version_file, port=8080, tokens=None):
+def make_server(version_file, port=8080, tokens=None, store=None):
     version = Path(version_file).read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", version):
         raise ValueError("version must contain the deployed 40-character Git commit SHA")
@@ -182,7 +277,8 @@ def make_server(version_file, port=8080, tokens=None):
     # route answers 401 and /health reports auth_configured=false.
     reporter, operator = tokens_from_env() if tokens is None else tokens
     auth_configured = bool(reporter and operator and reporter != operator)
-    store = Store()
+    db_config = database_config()
+    store = store or (PostgresStore(db_config) if db_config else Store())
 
     def identify(header):
         """Return (role, None) or (None, 401). Never reveals which token matched."""
@@ -231,7 +327,8 @@ def make_server(version_file, port=8080, tokens=None):
             path = urlsplit(self.path).path
             if path == "/health":
                 self._json(200, {"status": "ok", "service": "inspection", "version": version,
-                                 "started_at": started, "auth_configured": auth_configured})
+                                 "started_at": started, "auth_configured": auth_configured,
+                                 "db_configured": db_config is not None})
                 return
             if path == "/":
                 self._page(200)
@@ -244,11 +341,15 @@ def make_server(version_file, port=8080, tokens=None):
                 if role != "operator":
                     self._error(403, "operator role is required", "role")
                     return
-                if path == "/events":
-                    events = store.latest(MAX_LIST)
-                    self._json(200, {"count": len(events), "events": events})
+                try:
+                    if path == "/events":
+                        events = store.latest(MAX_LIST)
+                        self._json(200, {"count": len(events), "events": events})
+                        return
+                    event = store.get(unquote(path[len("/events/"):]))
+                except Exception:
+                    self._error(503, "database is unavailable", "database")
                     return
-                event = store.get(unquote(path[len("/events/"):]))
                 if event is None:
                     self._error(404, "event_id was not found", "event_id")
                     return
@@ -294,10 +395,15 @@ def make_server(version_file, port=8080, tokens=None):
             event = dict(payload)
             event["received_at"] = datetime.now(timezone.utc).isoformat(
                 timespec="seconds").replace("+00:00", "Z")
-            if not store.add(event):
+            try:
+                result, stored = store.put(event)
+            except Exception:
+                self._error(503, "database is unavailable", "database")
+                return
+            if result == "conflict":
                 self._error(409, "event_id already exists", "event_id")
                 return
-            self._json(201, event)
+            self._json(201 if result == "created" else 200, stored)
 
         def log_message(self, fmt, *args):
             pass  # Never log request paths, bodies, headers or query strings.

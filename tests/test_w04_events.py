@@ -91,6 +91,7 @@ class HealthAndAuth(ServiceHarness):
         self.assertEqual(body["service"], "inspection")
         self.assertEqual(body["status"], "ok")
         self.assertIs(body["auth_configured"], True)
+        self.assertIs(body["db_configured"], False)
         self.assertTrue(body["started_at"].endswith("Z"))
 
     def test_health_needs_no_token(self):
@@ -136,10 +137,13 @@ class EventIngest(ServiceHarness):
         self.assertTrue(body["received_at"].endswith("Z"))
         self.assertEqual(body["observed_at"], "2026-09-29T10:00:00+08:00")
 
-    def test_duplicate_event_id_is_409(self):
+    def test_duplicate_event_id_is_idempotent_or_conflicting(self):
         payload = fixture("event_success.json")
         self.assertEqual(self.json_call("POST", "/events", token=REPORTER, body=payload)[0], 201)
-        self.assertEqual(self.json_call("POST", "/events", token=REPORTER, body=payload)[0], 409)
+        self.assertEqual(self.json_call("POST", "/events", token=REPORTER, body=payload)[0], 200)
+        conflict = dict(payload, note="內容不同")
+        self.assertEqual(self.json_call("POST", "/events", token=REPORTER,
+                                        body=conflict)[0], 409)
 
     def test_reject_fixtures_report_the_offending_field(self):
         status, body = self.json_call("POST", "/events", token=REPORTER,
